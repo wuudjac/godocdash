@@ -1,191 +1,54 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type packageIndex struct {
-	Name string
-	Path string
-}
+const splitter = "=========================================================\n"
+const insertSQL = "INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?,?,?)"
 
-type packageInfo struct {
-	Name      string
-	Err       error
-	IsPackage bool
-	Consts    []packageIndex
-	Variables []packageIndex
-	Funcs     []packageIndex
-	Types     []packageIndex
-}
-
-func (info *packageInfo) Print() {
-	if info.Err != nil {
-		fmt.Printf("%s error: %s\n", info.Name, info.Err.Error())
-		return
-	}
-	if !info.IsPackage {
-		fmt.Printf("%s is not a package, skip\n", info.Name)
-		return
-	}
-	fmt.Printf("%s contains consts: %#v, funcs: %#v, types: %#v\n", info.Name, info.Consts, info.Funcs, info.Types)
-	return
-}
-
-func (info *packageInfo) Parse(doc *goquery.Document) {
-	wg := &sync.WaitGroup{}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		info.ParseType(doc)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		info.ParseFunc(doc)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		info.ParseConstAndVariable(doc)
-	}()
-
-	wg.Wait()
-}
-
-func (info *packageInfo) ParseType(doc *goquery.Document) {
-	doc.Find("h2").Each(func(index int, selection *goquery.Selection) {
-		text := selection.Text()
-		sign := "type "
-		if !strings.HasPrefix(text, sign) {
-			return
-		}
-		name, ok := selection.Attr("id")
-		if !ok {
-			return
-		}
-		href, ok := selection.Find("a.permalink").Attr("href")
-		if !ok {
-			return
-		}
-		info.Types = append(info.Types, packageIndex{
-			Name: name,
-			Path: href,
-		})
-	})
-}
-
-func (info *packageInfo) ParseFunc(doc *goquery.Document) {
-	doc.Find("h3").Each(func(index int, selection *goquery.Selection) {
-		text := selection.Text()
-		sign := "func "
-		if !strings.HasPrefix(text, sign) {
-			return
-		}
-		name, ok := selection.Attr("id")
-		if !ok {
-			return
-		}
-		href, ok := selection.Find("a.permalink").Attr("href")
-		if !ok {
-			return
-		}
-		info.Funcs = append(info.Funcs, packageIndex{
-			Name: name,
-			Path: href,
-		})
-	})
-}
-
-func (info *packageInfo) ParseConstAndVariable(doc *goquery.Document) {
-	doc.Find("pre").Each(func(index int, selection *goquery.Selection) {
-		text := selection.Text()
-		if strings.HasPrefix(text, "const") {
-			selection.Find("span").Each(func(index int, selection *goquery.Selection) {
-				id, ok := selection.Attr("id")
-				if !ok {
-					return
-				}
-				info.Consts = append(info.Consts, packageIndex{
-					Name: id,
-					Path: "#" + id,
-				})
-			})
-		} else if strings.HasPrefix(text, "var") {
-			selection.Find("span").Each(func(index int, selection *goquery.Selection) {
-				id, ok := selection.Attr("id")
-				if !ok {
-					return
-				}
-				info.Variables = append(info.Variables, packageIndex{
-					Name: id,
-					Path: "#" + id,
-				})
-			})
-		}
-	})
-}
-
-func (info *packageInfo) WriteDB(db *sql.DB) (err error) {
-	err = info.writeIndexes(db, "Type", info.Types)
-	if err != nil {
-		return
-	}
-	err = info.writeIndexes(db, "Function", info.Funcs)
-	if err != nil {
-		return
-	}
-	err = info.writeIndexes(db, "Constant", info.Consts)
-	if err != nil {
-		return
-	}
-	err = info.writeIndexes(db, "Variable", info.Variables)
-	if err != nil {
-		return
-	}
-
-	return
-}
-
-func (info *packageInfo) writeIndexes(db *sql.DB, typeName string, indexes []packageIndex) (err error) {
-	sql := `INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?,?,?)`
-	for _, index := range indexes {
-		name := info.Name + "." + index.Name
-		p := getDocumentPath(info.Name) + index.Path
-		_, err = db.Exec(sql, name, typeName, p)
-		if err != nil {
-			return
-		}
-	}
-
-	return
-}
-
+var silent bool
 var docsetDir string
 
 func main() {
-	name := "godoc"
-	docsetDir = fmt.Sprintf("%s.docset/Contents", name)
-	err := genPlist(name)
+	name, icon := parseFlag()
+	docsetDir = name + ".docset"
+
+	// icon
+	err := writeIcon(icon)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
+	// plist
+	err = genPlist(name)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// DB
 	db, err := createDB()
 	if err != nil {
 		fmt.Println(err)
@@ -193,16 +56,155 @@ func main() {
 	}
 	defer db.Close()
 
-	// TODO FIXME
-	host := "http://localhost:3000"
-	grabLib(host)
+	// godoc
+	cmd, host, err := runGodoc()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() {
+		printf("killing godoc on %s\n", host)
+		err = cmd.Process.Kill()
+		if err != nil {
+			fmt.Printf("error killing godoc on %s: %s\n", host, err.Error())
+		}
+	}()
 
+	// get package list
 	packages, err := getPackages(host)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	grabPackages(db, host, packages)
+
+	// download static resources like css and js
+	grabLib(host)
+
+	// prepare
+	stmt, err := db.Prepare(insertSQL)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer stmt.Close()
+	// transaction
+	tx, err := db.Begin()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer tx.Commit()
+
+	// download pages and insert DB indexes
+	grabPackages(tx.Stmt(stmt), host, packages)
+}
+
+func parseFlag() (name string, icon string) {
+	silentInput := flag.Bool("silent", false, "Silent mode (only print error)")
+	nameInput := flag.String("name", "GoDoc", "Set docset name")
+	iconInput := flag.String("icon", "", "Docset icon .png path")
+
+	flag.Parse()
+	silent = *silentInput
+	name = *nameInput
+	icon = *iconInput
+	return
+}
+
+func writeIcon(p string) (err error) {
+	var r io.Reader
+	if p == "" {
+		var buf []byte
+		buf, err = Asset("asset/godoc.png")
+		if err != nil {
+			return
+		}
+		r = bytes.NewReader(buf)
+	} else {
+		var f *os.File
+		f, err = os.Open(p)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		r = bufio.NewReader(f)
+	}
+
+	outputPath := filepath.Join(docsetDir, "icon.png")
+	err = os.MkdirAll(filepath.Dir(outputPath), 0755)
+	if err != nil {
+		return
+	}
+	w, err := os.Create(outputPath)
+	if err != nil {
+		return
+	}
+	_, err = io.Copy(w, r)
+	return
+}
+
+func createDB() (db *sql.DB, err error) {
+	p := filepath.Join(getResourcesDir(), "docSet.dsidx")
+	err = os.MkdirAll(filepath.Dir(p), 0755)
+	if err != nil {
+		return
+	}
+	os.Remove(p)
+	db, err = sql.Open("sqlite3", p)
+	if err != nil {
+		return db, err
+	}
+
+	_, err = db.Exec("CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)")
+	if err != nil {
+		return
+	}
+
+	_, err = db.Exec("CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)")
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func runGodoc() (cmd *exec.Cmd, host string, err error) {
+	// get a free port
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return
+	}
+	addr := l.Addr()
+	l.Close()
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		err = errors.New("failed to find a free port: " + addr.String())
+		return
+	}
+
+	// try running godoc on this port
+	tryHost := "localhost:" + strconv.Itoa(tcpAddr.Port)
+	cmd = exec.Command("godoc", "-http="+tryHost)
+	if !silent {
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
+	}
+	cmd.Env = os.Environ()
+	err = cmd.Start()
+	if err != nil {
+		return
+	}
+	host = "http://" + tryHost
+
+	// check port is valid now
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		_, err = http.Get(host)
+		if err == nil {
+			break
+		}
+	}
+	return
 }
 
 func getPackages(host string) (packages []string, err error) {
@@ -227,13 +229,13 @@ func getPackages(host string) (packages []string, err error) {
 	return
 }
 
-func grabPackages(db *sql.DB, host string, packages []string) {
+func grabPackages(stmt *sql.Stmt, host string, packages []string) {
 	wg := &sync.WaitGroup{}
 	for _, packageName := range packages {
 		wg.Add(1)
 		go grabPackage(
 			wg,
-			db,
+			stmt,
 			strings.TrimRight(packageName, "/"),
 			host+"/pkg/"+packageName,
 		)
@@ -243,7 +245,7 @@ func grabPackages(db *sql.DB, host string, packages []string) {
 	return
 }
 
-func grabPackage(wg *sync.WaitGroup, db *sql.DB, packageName string, url string) {
+func grabPackage(wg *sync.WaitGroup, stmt *sql.Stmt, packageName string, url string) {
 	defer wg.Done()
 
 	info := &packageInfo{Name: packageName}
@@ -288,7 +290,7 @@ func grabPackage(wg *sync.WaitGroup, db *sql.DB, packageName string, url string)
 	}
 
 	info.Parse(doc)
-	err = info.WriteDB(db)
+	err = info.WriteInsert(stmt)
 }
 
 func grabLib(host string) {
@@ -351,12 +353,13 @@ func grabDirectory(wg *sync.WaitGroup, host string, relPath string) {
 }
 
 func genPlist(docsetName string) (err error) {
-	err = os.MkdirAll(docsetDir, 0755)
+	contentsDir := getContentsDir()
+	err = os.MkdirAll(contentsDir, 0755)
 	if err != nil {
 		return
 	}
 
-	f, err := os.Create(filepath.Join(docsetDir, "Info.plist"))
+	f, err := os.Create(filepath.Join(contentsDir, "Info.plist"))
 	if err != nil {
 		return
 	}
@@ -380,31 +383,6 @@ func genPlist(docsetName string) (err error) {
 		titleName,
 		docsetName,
 	))
-	return
-}
-
-func createDB() (db *sql.DB, err error) {
-	p := filepath.Join(docsetDir, "Resources/docSet.dsidx")
-	err = os.MkdirAll(filepath.Dir(p), 0755)
-	if err != nil {
-		return
-	}
-	os.Remove(p)
-	db, err = sql.Open("sqlite3", p)
-	if err != nil {
-		return db, err
-	}
-
-	_, err = db.Exec("CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)")
-	if err != nil {
-		return
-	}
-
-	_, err = db.Exec("CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)")
-	if err != nil {
-		return
-	}
-
 	return
 }
 
@@ -447,7 +425,7 @@ func replaceLinks(doc *goquery.Document, documentPath string) {
 }
 
 func writeFile(relPath string, r io.Reader) (err error) {
-	p := filepath.Join(docsetDir, "Resources/Documents", relPath)
+	p := filepath.Join(getResourcesDir(), "Documents", relPath)
 	err = os.MkdirAll(filepath.Dir(p), 0755)
 	if err != nil {
 		return
@@ -463,6 +441,20 @@ func writeFile(relPath string, r io.Reader) (err error) {
 	return
 }
 
+func getResourcesDir() string {
+	return filepath.Join(getContentsDir(), "Resources")
+}
+
+func getContentsDir() string {
+	return filepath.Join(docsetDir, "Contents")
+}
+
 func getDocumentPath(packageName string) string {
 	return path.Join("pkg", packageName, "index.html")
+}
+
+func printf(format string, a ...interface{}) {
+	if !silent {
+		fmt.Printf(format, a...)
+	}
 }
