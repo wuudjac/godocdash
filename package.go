@@ -9,6 +9,11 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
+var parseFuncSelectors = []string{
+	"h2", // When function does not have any receiver type.
+	"h3", // When function has a receiver type.
+}
+
 type packageIndex struct {
 	Name string
 	Path string
@@ -17,7 +22,6 @@ type packageIndex struct {
 type packageInfo struct {
 	Name      string
 	Err       error
-	IsPackage bool
 	Consts    []packageIndex
 	Variables []packageIndex
 	Funcs     []packageIndex
@@ -29,7 +33,7 @@ func (info *packageInfo) Print() {
 		fmt.Printf("\n%s error: %s\n\n"+splitter, info.Name, info.Err.Error())
 		return
 	}
-	if !info.IsPackage {
+	if info.IsEmpty() {
 		printf("\n%s is not a package, skip\n\n"+splitter, info.Name)
 		return
 	}
@@ -46,6 +50,13 @@ func (info *packageInfo) Print() {
 		info.Types,
 	)
 	return
+}
+
+func (info *packageInfo) IsEmpty() bool {
+	return (len(info.Consts) +
+		len(info.Variables) +
+		len(info.Funcs) +
+		len(info.Types)) <= 0
 }
 
 func (info *packageInfo) Parse(doc *goquery.Document) {
@@ -93,25 +104,28 @@ func (info *packageInfo) ParseType(doc *goquery.Document) {
 }
 
 func (info *packageInfo) ParseFunc(doc *goquery.Document) {
-	doc.Find("h3").Each(func(index int, selection *goquery.Selection) {
-		text := selection.Text()
-		sign := "func "
-		if !strings.HasPrefix(text, sign) {
-			return
-		}
-		name, ok := selection.Attr("id")
-		if !ok {
-			return
-		}
-		href, ok := selection.Find("a.permalink").Attr("href")
-		if !ok {
-			return
-		}
-		info.Funcs = append(info.Funcs, packageIndex{
-			Name: name,
-			Path: href,
+	for _, selector := range parseFuncSelectors {
+		doc.Find(selector).Each(func(index int, selection *goquery.Selection) {
+			text := selection.Text()
+			sign := "func "
+			if !strings.HasPrefix(text, sign) {
+				return
+			}
+			name, ok := selection.Attr("id")
+			if !ok {
+				return
+			}
+			href, ok := selection.Find("a.permalink").Attr("href")
+			if !ok {
+				return
+			}
+
+			info.Funcs = append(info.Funcs, packageIndex{
+				Name: name,
+				Path: href,
+			})
 		})
-	})
+	}
 }
 
 func (info *packageInfo) ParseConstAndVariable(doc *goquery.Document) {

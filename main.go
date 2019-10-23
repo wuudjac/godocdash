@@ -271,11 +271,13 @@ func grabPackage(wg *sync.WaitGroup, stmt *sql.Stmt, packageName string, url str
 	}
 
 	// skip directories
-	pkgDir := doc.Find("div.pkg-dir").First()
-	if len(pkgDir.Nodes) > 0 {
+	info.Parse(doc)
+	if info.Err != nil {
 		return
 	}
-	info.IsPackage = true
+	if info.IsEmpty() {
+		return
+	}
 
 	documentPath := getDocumentPath(info.Name)
 	replaceLinks(doc, documentPath)
@@ -289,7 +291,6 @@ func grabPackage(wg *sync.WaitGroup, stmt *sql.Stmt, packageName string, url str
 		return
 	}
 
-	info.Parse(doc)
 	err = info.WriteInsert(stmt)
 }
 
@@ -304,7 +305,14 @@ func grabLib(host string) {
 func grabDirectory(wg *sync.WaitGroup, host string, relPath string) {
 	defer wg.Done()
 
-	resp, err := http.Get(host + "/" + relPath)
+	// Avoid visiting entries in godoc html template it self,
+	// e.g. entries in /lib/godoc/codewalkdir.html
+	if strings.Contains(relPath, "{{") {
+		return
+	}
+
+	url := host + "/" + relPath
+	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -331,9 +339,9 @@ func grabDirectory(wg *sync.WaitGroup, host string, relPath string) {
 			return
 		}
 
-		url := host + "/" + relPath + href
 		// download css and js
 		if strings.HasSuffix(href, ".css") || strings.HasSuffix(href, ".js") {
+			url := host + "/" + relPath + href
 			res, err := http.Get(url)
 			if err != nil {
 				fmt.Println(err)
@@ -347,7 +355,7 @@ func grabDirectory(wg *sync.WaitGroup, host string, relPath string) {
 		}
 		// or walk into next directory
 		wg.Add(1)
-		go grabDirectory(wg, host, url)
+		go grabDirectory(wg, host, relPath+href)
 	})
 	return
 }
