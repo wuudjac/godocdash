@@ -19,10 +19,12 @@ While running, `godocdash` will first start a temporary `godoc` server, then fin
 ## Installing
 
 ```
-go get github.com/wuudjac/godocdash
+go get -u github.com/wuudjac/godocdash
 ```
 
 And make sure `godoc` command is in your `$PATH`.
+
+Note: From go 1.13, `godoc` command has been removed from native distribution, you may need to [manually install](https://pkg.go.dev/golang.org/x/tools/cmd/godoc?tab=overview) it.
 
 ## Usage
 
